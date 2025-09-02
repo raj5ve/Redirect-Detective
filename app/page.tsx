@@ -55,7 +55,9 @@ export default function Home() {
     setRedirectChain(null);
 
     try {
-      const apiUrl = '/.netlify/functions/trace-redirects';
+      const apiUrl = process.env.NODE_ENV === 'development' 
+        ? '/api/trace-redirects' 
+        : '/.netlify/functions/trace-redirects';
       
       const response = await fetch(apiUrl, {
         method: 'POST',
