@@ -252,6 +252,16 @@ export default function Home() {
                             <Badge className={`${getStatusBadgeColor(step.statusCode)} text-white text-xs sm:text-sm px-2 sm:px-3 py-1 transition-colors`}>
                               {step.statusCode} {step.statusText}
                             </Badge>
+                            {step.redirectType && (
+                              <Badge variant="outline" className="text-xs sm:text-sm px-2 sm:px-3 py-1">
+                                {step.redirectType}
+                              </Badge>
+                            )}
+                            {step.redirectDelay && step.redirectDelay > 0 && (
+                              <Badge variant="secondary" className="text-xs sm:text-sm px-2 sm:px-3 py-1">
+                                Delay: {step.redirectDelay}s
+                              </Badge>
+                            )}
                             <div className="flex items-center gap-1 text-xs sm:text-sm text-gray-500">
                               <Clock className="h-3 w-3 sm:h-4 sm:w-4" />
                               {step.responseTime}ms
