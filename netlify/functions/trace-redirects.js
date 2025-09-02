@@ -1,6 +1,4 @@
-const https = require('https');
-const http = require('http');
-const { URL } = require('url');
+const fetch = require('node-fetch');
 
 exports.handler = async (event, context) => {
   const headers = {
@@ -63,38 +61,84 @@ async function traceRedirects(initialUrl) {
   let totalTime = 0;
   const maxRedirects = 20;
 
+  try {
+    // Validate URL
+    new URL(currentUrl);
+  } catch (error) {
+    throw new Error('Invalid URL provided');
+  }
+
   for (let i = 0; i < maxRedirects; i++) {
     const startTime = Date.now();
     
     try {
-      const result = await makeRequest(currentUrl);
+      const response = await fetch(currentUrl, {
+        method: 'HEAD',
+        redirect: 'manual',
+        follow: 0,
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        },
+      });
+
       const responseTime = Date.now() - startTime;
       totalTime += responseTime;
 
+      // Convert Headers object to plain object
+      const responseHeaders = {};
+      if (response.headers) {
+        response.headers.forEach((value, key) => {
+          responseHeaders[key.toLowerCase()] = value;
+        });
+      }
+
       const step = {
         url: currentUrl,
-        statusCode: result.statusCode,
-        statusText: result.statusMessage || getStatusText(result.statusCode),
-        headers: result.headers,
+        statusCode: response.status,
+        statusText: response.statusText || getStatusText(response.status),
+        headers: responseHeaders,
         responseTime,
       };
 
       steps.push(step);
 
       // Check if it's a redirect
-      if (result.statusCode >= 300 && result.statusCode < 400) {
-        const location = result.headers.location;
+      if (response.status >= 300 && response.status < 400) {
+        const location = responseHeaders['location'];
+        
         if (location) {
           // Handle relative URLs
-          if (location.startsWith('/')) {
-            const urlObj = new URL(currentUrl);
-            currentUrl = `${urlObj.protocol}//${urlObj.host}${location}`;
-          } else if (!location.startsWith('http')) {
-            const urlObj = new URL(currentUrl);
-            const basePath = urlObj.pathname.endsWith('/') ? urlObj.pathname : urlObj.pathname + '/';
-            currentUrl = `${urlObj.protocol}//${urlObj.host}${basePath}${location}`;
-          } else {
-            currentUrl = location;
+          try {
+            if (location.startsWith('http://') || location.startsWith('https://')) {
+              currentUrl = location;
+            } else if (location.startsWith('//')) {
+              const urlObj = new URL(currentUrl);
+              currentUrl = `${urlObj.protocol}${location}`;
+            } else if (location.startsWith('/')) {
+              const urlObj = new URL(currentUrl);
+              currentUrl = `${urlObj.protocol}//${urlObj.host}${location}`;
+            } else {
+              const urlObj = new URL(currentUrl);
+              const basePath = urlObj.pathname.endsWith('/') ? urlObj.pathname : urlObj.pathname.replace(/[^/]*$/, '');
+              currentUrl = `${urlObj.protocol}//${urlObj.host}${basePath}${location}`;
+            }
+            
+            // Validate the new URL
+            new URL(currentUrl);
+          } catch (error) {
+            console.error('Invalid redirect URL:', location);
+            break;
           }
         } else {
           break; // No location header, stop
@@ -102,14 +146,35 @@ async function traceRedirects(initialUrl) {
       } else {
         break; // Not a redirect, stop
       }
+
+      // Prevent infinite loops
+      const previousUrls = steps.map(s => s.url);
+      if (previousUrls.includes(currentUrl)) {
+        console.log('Circular redirect detected, stopping');
+        break;
+      }
+
     } catch (error) {
       const responseTime = Date.now() - startTime;
       totalTime += responseTime;
       
+      let errorMessage = 'Connection Failed';
+      if (error.name === 'AbortError' || error.code === 'ETIMEDOUT') {
+        errorMessage = 'Request Timeout';
+      } else if (error.code === 'ENOTFOUND') {
+        errorMessage = 'DNS Resolution Failed';
+      } else if (error.code === 'ECONNREFUSED') {
+        errorMessage = 'Connection Refused';
+      } else if (error.code === 'CERT_HAS_EXPIRED') {
+        errorMessage = 'SSL Certificate Expired';
+      } else if (error.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+        errorMessage = 'SSL Certificate Invalid';
+      }
+      
       steps.push({
         url: currentUrl,
         statusCode: 0,
-        statusText: 'Connection Failed',
+        statusText: errorMessage,
         headers: {},
         responseTime,
       });
@@ -125,57 +190,13 @@ async function traceRedirects(initialUrl) {
   };
 }
 
-function makeRequest(url) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const isHttps = urlObj.protocol === 'https:';
-    const client = isHttps ? https : http;
-
-    const options = {
-      method: 'HEAD',
-      hostname: urlObj.hostname,
-      port: urlObj.port || (isHttps ? 443 : 80),
-      path: urlObj.pathname + urlObj.search,
-      headers: {
-        'User-Agent': 'Redirect Detector Tool/1.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-      },
-      timeout: 10000,
-    };
-
-    const req = client.request(options, (res) => {
-      const headers = {};
-      Object.keys(res.headers).forEach(key => {
-        headers[key] = res.headers[key];
-      });
-
-      resolve({
-        statusCode: res.statusCode,
-        statusMessage: res.statusMessage,
-        headers,
-      });
-    });
-
-    req.on('error', (error) => {
-      reject(error);
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timeout'));
-    });
-
-    req.end();
-  });
-}
-
 function getStatusText(statusCode) {
   const statusTexts = {
+    100: 'Continue',
+    101: 'Switching Protocols',
     200: 'OK',
     201: 'Created',
+    202: 'Accepted',
     204: 'No Content',
     301: 'Moved Permanently',
     302: 'Found',
@@ -188,6 +209,7 @@ function getStatusText(statusCode) {
     403: 'Forbidden',
     404: 'Not Found',
     405: 'Method Not Allowed',
+    429: 'Too Many Requests',
     500: 'Internal Server Error',
     502: 'Bad Gateway',
     503: 'Service Unavailable',
