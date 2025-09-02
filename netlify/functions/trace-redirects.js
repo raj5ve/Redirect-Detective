@@ -1,4 +1,6 @@
-const { chromium } = require('playwright-core');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 
 exports.handler = async (event, context) => {
   const headers = {
@@ -24,7 +26,6 @@ exports.handler = async (event, context) => {
     };
   }
 
-  let browser;
   try {
     const { url } = JSON.parse(event.body);
 
@@ -36,27 +37,7 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // Launch browser with minimal configuration for serverless
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1920x1080'
-      ]
-    });
-
-    const context = await browser.newContext({
-      userAgent: 'Redirect Detector Tool/1.0 (Playwright)',
-      viewport: { width: 1920, height: 1080 }
-    });
-    
-    const page = await context.newPage();
-    
-    const redirectChain = await traceRedirectsWithPlaywright(page, url);
+    const redirectChain = await traceRedirects(url);
     
     return {
       statusCode: 200,
@@ -73,146 +54,145 @@ exports.handler = async (event, context) => {
         details: error.message 
       }),
     };
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
 };
 
-async function traceRedirectsWithPlaywright(page, initialUrl) {
+async function traceRedirects(initialUrl) {
   const steps = [];
+  let currentUrl = initialUrl;
   let totalTime = 0;
-  const navigationSteps = [];
-  let navigationStartTime = Date.now();
+  const maxRedirects = 20;
 
-  // Track all navigation events
-  page.on('response', (response) => {
-    const responseTime = Date.now() - navigationStartTime;
-    const headers = {};
-    
-    // Extract headers
-    for (const [key, value] of Object.entries(response.headers())) {
-      headers[key] = value;
-    }
-
-    navigationSteps.push({
-      url: response.url(),
-      statusCode: response.status(),
-      statusText: response.statusText(),
-      headers,
-      responseTime,
-      fromCache: response.fromCache(),
-    });
-  });
-
-  page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) {
-      navigationStartTime = Date.now();
-    }
-  });
-
-  try {
+  for (let i = 0; i < maxRedirects; i++) {
     const startTime = Date.now();
     
-    // Navigate to the initial URL and wait for network to be idle
-    await page.goto(initialUrl, {
-      waitUntil: 'networkidle',
-      timeout: 30000
-    });
+    try {
+      const result = await makeRequest(currentUrl);
+      const responseTime = Date.now() - startTime;
+      totalTime += responseTime;
 
-    const endTime = Date.now();
-    totalTime = endTime - startTime;
+      const step = {
+        url: currentUrl,
+        statusCode: result.statusCode,
+        statusText: result.statusMessage || getStatusText(result.statusCode),
+        headers: result.headers,
+        responseTime,
+      };
 
-    // Get the final URL after all redirects
-    const finalUrl = page.url();
+      steps.push(step);
 
-    // Process all captured navigation steps
-    const mainFrameSteps = navigationSteps.filter(step => {
-      // Include main document requests and redirects
-      const isMainDocument = step.url === initialUrl || step.url === finalUrl;
-      const isRedirect = step.statusCode >= 300 && step.statusCode < 400;
-      const isRelevantStep = isMainDocument || isRedirect || 
-        (step.url.includes(new URL(initialUrl).hostname));
-      
-      return isRelevantStep;
-    });
-
-    // Sort by response time and remove duplicates
-    const uniqueSteps = [];
-    const seenUrls = new Set();
-    
-    for (const step of mainFrameSteps) {
-      if (!seenUrls.has(step.url)) {
-        seenUrls.add(step.url);
-        uniqueSteps.push({
-          url: step.url,
-          statusCode: step.statusCode,
-          statusText: step.statusText,
-          headers: step.headers,
-          responseTime: step.responseTime
-        });
+      // Check if it's a redirect
+      if (result.statusCode >= 300 && result.statusCode < 400) {
+        const location = result.headers.location;
+        if (location) {
+          // Handle relative URLs
+          if (location.startsWith('/')) {
+            const urlObj = new URL(currentUrl);
+            currentUrl = `${urlObj.protocol}//${urlObj.host}${location}`;
+          } else if (!location.startsWith('http')) {
+            const urlObj = new URL(currentUrl);
+            const basePath = urlObj.pathname.endsWith('/') ? urlObj.pathname : urlObj.pathname + '/';
+            currentUrl = `${urlObj.protocol}//${urlObj.host}${basePath}${location}`;
+          } else {
+            currentUrl = location;
+          }
+        } else {
+          break; // No location header, stop
+        }
+      } else {
+        break; // Not a redirect, stop
       }
-    }
-
-    steps.push(...uniqueSteps);
-
-    // If no redirect steps were captured but URLs differ, add both
-    if (steps.length === 0 && initialUrl !== finalUrl) {
-      steps.push({
-        url: initialUrl,
-        statusCode: 302,
-        statusText: 'Found',
-        headers: {},
-        responseTime: Math.floor(totalTime / 2)
-      });
+    } catch (error) {
+      const responseTime = Date.now() - startTime;
+      totalTime += responseTime;
       
       steps.push({
-        url: finalUrl,
-        statusCode: 200,
-        statusText: 'OK',
-        headers: {},
-        responseTime: Math.floor(totalTime / 2)
-      });
-    }
-
-    // If still no steps, add the initial request
-    if (steps.length === 0) {
-      steps.push({
-        url: finalUrl,
-        statusCode: 200,
-        statusText: 'OK',
-        headers: {},
-        responseTime: totalTime
-      });
-    }
-
-    // Calculate total redirects (3xx status codes)
-    const totalRedirects = steps.filter(step => 
-      step.statusCode >= 300 && step.statusCode < 400
-    ).length;
-
-    return {
-      steps,
-      finalUrl,
-      totalTime,
-      totalRedirects,
-    };
-
-  } catch (error) {
-    console.error('Playwright navigation failed:', error);
-    // If navigation fails, return error info
-    return {
-      steps: [{
-        url: initialUrl,
+        url: currentUrl,
         statusCode: 0,
-        statusText: 'Navigation Failed',
+        statusText: 'Connection Failed',
         headers: {},
-        responseTime: Date.now() - Date.now()
-      }],
-      finalUrl: initialUrl,
-      totalTime: 0,
-      totalRedirects: 0,
-    };
+        responseTime,
+      });
+      break;
+    }
   }
+
+  return {
+    steps,
+    finalUrl: currentUrl,
+    totalTime,
+    totalRedirects: steps.filter(step => step.statusCode >= 300 && step.statusCode < 400).length,
+  };
+}
+
+function makeRequest(url) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const isHttps = urlObj.protocol === 'https:';
+    const client = isHttps ? https : http;
+
+    const options = {
+      method: 'HEAD',
+      hostname: urlObj.hostname,
+      port: urlObj.port || (isHttps ? 443 : 80),
+      path: urlObj.pathname + urlObj.search,
+      headers: {
+        'User-Agent': 'Redirect Detector Tool/1.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+      },
+      timeout: 10000,
+    };
+
+    const req = client.request(options, (res) => {
+      const headers = {};
+      Object.keys(res.headers).forEach(key => {
+        headers[key] = res.headers[key];
+      });
+
+      resolve({
+        statusCode: res.statusCode,
+        statusMessage: res.statusMessage,
+        headers,
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(error);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+
+    req.end();
+  });
+}
+
+function getStatusText(statusCode) {
+  const statusTexts = {
+    200: 'OK',
+    201: 'Created',
+    204: 'No Content',
+    301: 'Moved Permanently',
+    302: 'Found',
+    303: 'See Other',
+    304: 'Not Modified',
+    307: 'Temporary Redirect',
+    308: 'Permanent Redirect',
+    400: 'Bad Request',
+    401: 'Unauthorized',
+    403: 'Forbidden',
+    404: 'Not Found',
+    405: 'Method Not Allowed',
+    500: 'Internal Server Error',
+    502: 'Bad Gateway',
+    503: 'Service Unavailable',
+    504: 'Gateway Timeout',
+  };
+  
+  return statusTexts[statusCode] || 'Unknown Status';
 }
