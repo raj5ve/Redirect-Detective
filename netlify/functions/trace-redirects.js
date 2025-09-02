@@ -83,13 +83,10 @@ exports.handler = async (event, context) => {
 async function traceRedirectsWithPlaywright(page, initialUrl) {
   const steps = [];
   let totalTime = 0;
-  const maxRedirects = 20;
-  let currentUrl = initialUrl;
-  
-  // Track all navigation events
   const navigationSteps = [];
   let navigationStartTime = Date.now();
 
+  // Track all navigation events
   page.on('response', (response) => {
     const responseTime = Date.now() - navigationStartTime;
     const headers = {};
@@ -119,7 +116,7 @@ async function traceRedirectsWithPlaywright(page, initialUrl) {
     const startTime = Date.now();
     
     // Navigate to the initial URL and wait for network to be idle
-    await page.goto(currentUrl, {
+    await page.goto(initialUrl, {
       waitUntil: 'networkidle',
       timeout: 30000
     });
@@ -131,11 +128,24 @@ async function traceRedirectsWithPlaywright(page, initialUrl) {
     const finalUrl = page.url();
 
     // Process all captured navigation steps
-    for (const step of navigationSteps) {
-      // Only include main frame responses
-      if (step.url === currentUrl || step.url === finalUrl || 
-          (step.statusCode >= 300 && step.statusCode < 400)) {
-        steps.push({
+    const mainFrameSteps = navigationSteps.filter(step => {
+      // Include main document requests and redirects
+      const isMainDocument = step.url === initialUrl || step.url === finalUrl;
+      const isRedirect = step.statusCode >= 300 && step.statusCode < 400;
+      const isRelevantStep = isMainDocument || isRedirect || 
+        (step.url.includes(new URL(initialUrl).hostname));
+      
+      return isRelevantStep;
+    });
+
+    // Sort by response time and remove duplicates
+    const uniqueSteps = [];
+    const seenUrls = new Set();
+    
+    for (const step of mainFrameSteps) {
+      if (!seenUrls.has(step.url)) {
+        seenUrls.add(step.url);
+        uniqueSteps.push({
           url: step.url,
           statusCode: step.statusCode,
           statusText: step.statusText,
@@ -145,14 +155,16 @@ async function traceRedirectsWithPlaywright(page, initialUrl) {
       }
     }
 
+    steps.push(...uniqueSteps);
+
     // If no redirect steps were captured but URLs differ, add both
-    if (steps.length === 0 && currentUrl !== finalUrl) {
+    if (steps.length === 0 && initialUrl !== finalUrl) {
       steps.push({
-        url: currentUrl,
-        statusCode: 200,
-        statusText: 'OK',
+        url: initialUrl,
+        statusCode: 302,
+        statusText: 'Found',
         headers: {},
-        responseTime: totalTime
+        responseTime: Math.floor(totalTime / 2)
       });
       
       steps.push({
@@ -160,7 +172,7 @@ async function traceRedirectsWithPlaywright(page, initialUrl) {
         statusCode: 200,
         statusText: 'OK',
         headers: {},
-        responseTime: 0
+        responseTime: Math.floor(totalTime / 2)
       });
     }
 
@@ -188,85 +200,19 @@ async function traceRedirectsWithPlaywright(page, initialUrl) {
     };
 
   } catch (error) {
-    // If navigation fails, try to get basic info with fetch fallback
-    return await fallbackTrace(initialUrl);
-  }
-}
-
-// Fallback method using fetch if Playwright fails
-async function fallbackTrace(initialUrl) {
-  const steps = [];
-  let currentUrl = initialUrl;
-  let totalTime = 0;
-  const maxRedirects = 10;
-
-  for (let i = 0; i < maxRedirects; i++) {
-    const startTime = Date.now();
-    
-    try {
-      const response = await fetch(currentUrl, {
-        method: 'HEAD',
-        redirect: 'manual',
-        headers: {
-          'User-Agent': 'Redirect Detector Tool/1.0',
-        },
-      });
-
-      const responseTime = Date.now() - startTime;
-      totalTime += responseTime;
-
-      const headers = {};
-      response.headers.forEach((value, key) => {
-        headers[key] = value;
-      });
-
-      const step = {
-        url: currentUrl,
-        statusCode: response.status,
-        statusText: response.statusText,
-        headers,
-        responseTime,
-      };
-
-      steps.push(step);
-
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('location');
-        if (location) {
-          if (location.startsWith('/')) {
-            const urlObj = new URL(currentUrl);
-            currentUrl = `${urlObj.protocol}//${urlObj.host}${location}`;
-          } else if (!location.startsWith('http')) {
-            const urlObj = new URL(currentUrl);
-            currentUrl = `${urlObj.protocol}//${urlObj.host}/${location}`;
-          } else {
-            currentUrl = location;
-          }
-        } else {
-          break;
-        }
-      } else {
-        break;
-      }
-    } catch (error) {
-      const responseTime = Date.now() - startTime;
-      totalTime += responseTime;
-      
-      steps.push({
-        url: currentUrl,
+    console.error('Playwright navigation failed:', error);
+    // If navigation fails, return error info
+    return {
+      steps: [{
+        url: initialUrl,
         statusCode: 0,
-        statusText: 'Connection Failed',
+        statusText: 'Navigation Failed',
         headers: {},
-        responseTime,
-      });
-      break;
-    }
+        responseTime: Date.now() - Date.now()
+      }],
+      finalUrl: initialUrl,
+      totalTime: 0,
+      totalRedirects: 0,
+    };
   }
-
-  return {
-    steps,
-    finalUrl: currentUrl,
-    totalTime,
-    totalRedirects: steps.filter(step => step.statusCode >= 300 && step.statusCode < 400).length,
-  };
 }
