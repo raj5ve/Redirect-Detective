@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+const cheerio = require('cheerio');
 
 exports.handler = async (event, context) => {
   const headers = {
@@ -60,6 +61,7 @@ async function traceRedirects(initialUrl) {
   let currentUrl = initialUrl;
   let totalTime = 0;
   const maxRedirects = 20;
+  const visitedUrls = new Set();
 
   try {
     // Validate URL
@@ -71,22 +73,30 @@ async function traceRedirects(initialUrl) {
   for (let i = 0; i < maxRedirects; i++) {
     const startTime = Date.now();
     
+    // Check for circular redirects
+    if (visitedUrls.has(currentUrl)) {
+      console.log('Circular redirect detected, stopping');
+      break;
+    }
+    visitedUrls.add(currentUrl);
+    
     try {
       const response = await fetch(currentUrl, {
-        method: 'HEAD',
+        method: 'GET', // Changed to GET to get HTML content
         redirect: 'manual',
         follow: 0,
         timeout: 15000,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate, br',
           'Connection': 'keep-alive',
           'Upgrade-Insecure-Requests': '1',
           'Sec-Fetch-Dest': 'document',
           'Sec-Fetch-Mode': 'navigate',
           'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
           'Cache-Control': 'no-cache',
           'Pragma': 'no-cache'
         },
@@ -109,33 +119,20 @@ async function traceRedirects(initialUrl) {
         statusText: response.statusText || getStatusText(response.status),
         headers: responseHeaders,
         responseTime,
+        redirectType: 'HTTP'
       };
 
       steps.push(step);
 
-      // Check if it's a redirect
+      // Check for HTTP redirects
       if (response.status >= 300 && response.status < 400) {
         const location = responseHeaders['location'];
         
         if (location) {
-          // Handle relative URLs
           try {
-            if (location.startsWith('http://') || location.startsWith('https://')) {
-              currentUrl = location;
-            } else if (location.startsWith('//')) {
-              const urlObj = new URL(currentUrl);
-              currentUrl = `${urlObj.protocol}${location}`;
-            } else if (location.startsWith('/')) {
-              const urlObj = new URL(currentUrl);
-              currentUrl = `${urlObj.protocol}//${urlObj.host}${location}`;
-            } else {
-              const urlObj = new URL(currentUrl);
-              const basePath = urlObj.pathname.endsWith('/') ? urlObj.pathname : urlObj.pathname.replace(/[^/]*$/, '');
-              currentUrl = `${urlObj.protocol}//${urlObj.host}${basePath}${location}`;
-            }
-            
-            // Validate the new URL
-            new URL(currentUrl);
+            currentUrl = resolveUrl(currentUrl, location);
+            step.redirectType = `HTTP ${response.status}`;
+            continue;
           } catch (error) {
             console.error('Invalid redirect URL:', location);
             break;
@@ -143,14 +140,46 @@ async function traceRedirects(initialUrl) {
         } else {
           break; // No location header, stop
         }
+      } else if (response.status >= 200 && response.status < 300) {
+        // For successful responses, check for HTML-based redirects
+        try {
+          const contentType = responseHeaders['content-type'] || '';
+          
+          if (contentType.includes('text/html')) {
+            const html = await response.text();
+            const htmlRedirect = await detectHtmlRedirects(html, currentUrl);
+            
+            if (htmlRedirect) {
+              // Add another step for HTML redirect
+              const htmlRedirectStartTime = Date.now();
+              const htmlRedirectStep = {
+                url: currentUrl,
+                statusCode: 200,
+                statusText: 'HTML Redirect Detected',
+                headers: responseHeaders,
+                responseTime: Date.now() - htmlRedirectStartTime,
+                redirectType: htmlRedirect.type,
+                redirectDelay: htmlRedirect.delay || 0
+              };
+              
+              if (steps[steps.length - 1].url === currentUrl) {
+                // Update the last step instead of adding duplicate
+                steps[steps.length - 1].redirectType = htmlRedirect.type;
+                steps[steps.length - 1].redirectDelay = htmlRedirect.delay || 0;
+              }
+              
+              currentUrl = htmlRedirect.url;
+              continue;
+            }
+          }
+        } catch (htmlError) {
+          console.log('Could not parse HTML for redirects:', htmlError.message);
+        }
+        
+        // No more redirects found
+        break;
       } else {
-        break; // Not a redirect, stop
-      }
-
-      // Prevent infinite loops
-      const previousUrls = steps.map(s => s.url);
-      if (previousUrls.includes(currentUrl)) {
-        console.log('Circular redirect detected, stopping');
+        // Error status, stop
         break;
       }
 
@@ -177,6 +206,7 @@ async function traceRedirects(initialUrl) {
         statusText: errorMessage,
         headers: {},
         responseTime,
+        redirectType: 'Error'
       });
       break;
     }
@@ -186,8 +216,111 @@ async function traceRedirects(initialUrl) {
     steps,
     finalUrl: currentUrl,
     totalTime,
-    totalRedirects: steps.filter(step => step.statusCode >= 300 && step.statusCode < 400).length,
+    totalRedirects: steps.filter(step => 
+      (step.statusCode >= 300 && step.statusCode < 400) || 
+      step.redirectType?.includes('Meta') || 
+      step.redirectType?.includes('JavaScript')
+    ).length,
   };
+}
+
+async function detectHtmlRedirects(html, currentUrl) {
+  try {
+    const $ = cheerio.load(html);
+    
+    // Check for meta refresh redirects
+    const metaRefresh = $('meta[http-equiv="refresh"]').first();
+    if (metaRefresh.length > 0) {
+      const content = metaRefresh.attr('content');
+      if (content) {
+        const match = content.match(/(?:^|;\s*)url=(.+?)(?:$|;)/i);
+        if (match) {
+          let redirectUrl = match[1].trim().replace(/^['"]|['"]$/g, '');
+          const delayMatch = content.match(/^\s*(\d+)/);
+          const delay = delayMatch ? parseInt(delayMatch[1]) : 0;
+          
+          return {
+            url: resolveUrl(currentUrl, redirectUrl),
+            type: `Meta Refresh (${delay}s)`,
+            delay: delay
+          };
+        }
+      }
+    }
+    
+    // Check for JavaScript redirects
+    const scripts = $('script').toArray();
+    for (const script of scripts) {
+      const scriptContent = $(script).html() || '';
+      
+      // Common JavaScript redirect patterns
+      const jsRedirectPatterns = [
+        /window\.location\.href\s*=\s*['"`]([^'"`]+)['"`]/i,
+        /window\.location\s*=\s*['"`]([^'"`]+)['"`]/i,
+        /location\.href\s*=\s*['"`]([^'"`]+)['"`]/i,
+        /location\s*=\s*['"`]([^'"`]+)['"`]/i,
+        /window\.location\.replace\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/i,
+        /location\.replace\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/i,
+        /window\.open\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*['"`]_self['"`]/i
+      ];
+      
+      for (const pattern of jsRedirectPatterns) {
+        const match = scriptContent.match(pattern);
+        if (match) {
+          return {
+            url: resolveUrl(currentUrl, match[1]),
+            type: 'JavaScript Redirect',
+            delay: 0
+          };
+        }
+      }
+      
+      // Check for setTimeout redirects
+      const timeoutMatch = scriptContent.match(/setTimeout\s*\(\s*(?:function\s*\(\)\s*\{|)\s*(?:window\.)?location(?:\.href)?\s*=\s*['"`]([^'"`]+)['"`]/i);
+      if (timeoutMatch) {
+        return {
+          url: resolveUrl(currentUrl, timeoutMatch[1]),
+          type: 'JavaScript Timeout Redirect',
+          delay: 0
+        };
+      }
+    }
+    
+    // Check for immediate JavaScript redirects in inline scripts
+    const inlineRedirectMatch = html.match(/<script[^>]*>[\s\S]*?(?:window\.)?location(?:\.href)?\s*=\s*['"`]([^'"`]+)['"`][\s\S]*?<\/script>/i);
+    if (inlineRedirectMatch) {
+      return {
+        url: resolveUrl(currentUrl, inlineRedirectMatch[1]),
+        type: 'JavaScript Redirect',
+        delay: 0
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.log('Error detecting HTML redirects:', error.message);
+    return null;
+  }
+}
+
+function resolveUrl(baseUrl, relativeUrl) {
+  try {
+    // Handle absolute URLs
+    if (relativeUrl.startsWith('http://') || relativeUrl.startsWith('https://')) {
+      return relativeUrl;
+    }
+    
+    // Handle protocol-relative URLs
+    if (relativeUrl.startsWith('//')) {
+      const baseUrlObj = new URL(baseUrl);
+      return `${baseUrlObj.protocol}${relativeUrl}`;
+    }
+    
+    // Handle relative URLs
+    return new URL(relativeUrl, baseUrl).href;
+  } catch (error) {
+    throw new Error(`Invalid URL: ${relativeUrl}`);
+  }
 }
 
 function getStatusText(statusCode) {
